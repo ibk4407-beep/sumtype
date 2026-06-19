@@ -192,15 +192,31 @@ async function run() {
   document.getElementById("result").classList.remove("show");
   showSpinner();
 
+  if (location.protocol === "file:") {
+    showMsg("ローカルファイル（file://）では動きません。Netlify のサイトURLを開いてください。", true);
+    btn.disabled = false; return;
+  }
+
   try {
     const url = `/.netlify/functions/analyze?gameName=${encodeURIComponent(gameName)}&tagLine=${encodeURIComponent(tagLine)}`;
     const res = await fetch(url);
+    const ct = res.headers.get("content-type") || "";
+
+    if (!ct.includes("json")) {
+      if (res.status === 404) {
+        showMsg("Function が見つかりません（404）。リポジトリ直下に index.html・netlify.toml・netlify/ が並んでいるか確認してください。", true);
+      } else {
+        showMsg(`サーバー応答を解釈できませんでした（HTTP ${res.status}）。Netlify の Functions デプロイ状態を確認してください。`, true);
+      }
+      return;
+    }
+
     const data = await res.json();
-    if (!res.ok || data.error) { showMsg(data.error || "取得に失敗しました。", true); return; }
+    if (!res.ok || data.error) { showMsg(data.error || `取得に失敗しました（HTTP ${res.status}）`, true); return; }
     clearMsg();
     renderResult(data, false);
   } catch (e) {
-    showMsg("通信エラーが発生しました。デプロイ環境（Netlify Functions）が必要です。", true);
+    showMsg("通信に失敗しました。Netlify のサイトURLを開いているか、ネットワークを確認してください。", true);
   } finally {
     btn.disabled = false;
   }
