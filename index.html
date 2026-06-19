@@ -143,7 +143,6 @@
     <div class="section"><h2>プレイスタイル</h2><div id="r-axes"></div></div>
     <div class="section"><h2>直近の指標</h2><div class="stat-grid" id="r-stats"></div></div>
     <div class="section"><h2>得意・苦手ピック</h2><div id="r-champs"></div></div>
-    <div class="section"><h2>対面相性</h2><div id="r-matchups"></div></div>
     <div class="section weak"><h2>伸びしろ</h2><ul id="r-weak"></ul></div>
     <div class="section"><h2>チャンピオンマスタリー</h2><div class="mastery-grid" id="r-mastery"></div></div>
 
@@ -236,7 +235,6 @@ function renderResult(d, isDemo) {
     tg.appendChild(btn);
   });
 
-  renderMatchups(d.matchups);
   renderMastery(d.mastery);
   renderBucket();
 
@@ -309,20 +307,6 @@ function renderBucket() {
     : `※ ${label}の直近${b.sampleSize}試合を、${roleJP}の基準値で正規化して算出しています。`;
 }
 
-function renderMatchups(mu) {
-  const w = document.getElementById("r-matchups");
-  if (!mu || (!mu.best && !mu.worst)) {
-    w.innerHTML = `<div class="empty">対面${mu ? mu.threshold : 6}戦以上のデータがまだ十分にありません。試合数が増えると、対面が得意・苦手なチャンピオンが表示されます。</div>`;
-    return;
-  }
-  let html = "";
-  if (mu.best) html += `<div class="row"><div class="name"><span class="tag2 tag-best">対面◎</span>${mu.best.champion}</div>
-    <div class="meta">${mu.best.games}戦 · <span class="wr">勝率 ${Math.round(mu.best.winrate*100)}%</span></div></div>`;
-  if (mu.worst) html += `<div class="row"><div class="name"><span class="tag2 tag-worst">対面△</span>${mu.worst.champion}</div>
-    <div class="meta">${mu.worst.games}戦 · <span class="wr">勝率 ${Math.round(mu.worst.winrate*100)}%</span></div></div>`;
-  w.innerHTML = html;
-}
-
 function renderMastery(mastery) {
   const w = document.getElementById("r-mastery");
   if (!mastery || mastery.length === 0) { w.innerHTML = `<div class="empty">マスタリー情報を取得できませんでした。</div>`; return; }
@@ -377,7 +361,6 @@ const DEMO_DATA = {
     { name:"Vi", level:9, points:352140 }, { name:"JarvanIV", level:7, points:98220 },
     { name:"Nocturne", level:6, points:54110 }, { name:"LeeSin", level:5, points:31980 },
   ],
-  matchups: { threshold:6, best:{champion:"LeeSin",games:9,winrate:0.667}, worst:{champion:"Elise",games:7,winrate:0.286} },
   buckets: {
     all: {
       sampleSize:42, winrate:0.571, mainRole:"JUNGLE",

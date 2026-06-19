@@ -11,7 +11,6 @@ const NORMAL_QUEUES = new Set([400, 430]);        // 通常Draft / 通常Blind
 const SR_QUEUES = new Set([400, 420, 430, 440, 700]); // 上記 + Clash（全体に含める）
 const MATCH_COUNT = 50;     // 直近の取得試合数
 const MIN_DURATION = 300;   // 5分未満はリメイク扱いで除外
-const MATCHUP_MIN = 6;      // 対面サンプル：5戦以下は除外（6戦以上を採用）
 const MASTERY_TOP = 8;      // 表示するマスタリー上位数
 
 // ロール別の基準値 [低い, 高い]（JPソロキューのおおよその目安・要キャリブレーション）
@@ -56,13 +55,8 @@ exports.handler = async (event) => {
     const matchIds = await idsRes.json();
     if (!Array.isArray(matchIds) || matchIds.length === 0) return resp(404, { error: "直近の試合データが見つかりませんでした。" });
 
-    // 3. 各試合の詳細（順次取得）
-    const matches = [];
-    for (const id of matchIds) {
-      const mRes = await riot(REGION, `/lol/match/v5/matches/${id}`);
-      if (mRes.status === 429) break;
-      if (mRes.ok) matches.push(await mRes.json());
-    }
+    // 3. 各試合の詳細（並列取得：レート制限内で高速化）
+    const matches = await fetchMatchesConcurrent(riot, matchIds);
 
     // 4. ランク（任意）
     let rank = null;
@@ -92,20 +86,42 @@ exports.handler = async (event) => {
   }
 };
 
-// チャンピオンID→名前。まず試合データ、足りない分を Data Dragon で補完。
-async function getChampMap(matches) {
+// 試合詳細を並列取得（concurrency制限でレート制限内に収める）
+async function fetchMatchesConcurrent(riot, ids, conc = 8) {
+  const out = []; let idx = 0; let stop = false;
+  async function worker() {
+    while (idx < ids.length && !stop) {
+      const id = ids[idx++];
+      const r = await riot(REGION, `/lol/match/v5/matches/${id}`);
+      if (r.status === 429) { stop = true; return; }
+      if (r.ok) out.push(await r.json());
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(conc, ids.length) }, worker));
+  return out;
+}
+
+// Data Dragon のチャンピオンID→名前（ウォームスタート間でメモ化）
+let DDRAGON_MAP = null;
+async function getDdragonMap() {
+  if (DDRAGON_MAP) return DDRAGON_MAP;
   const map = {};
+  try {
+    const opt = { signal: AbortSignal.timeout(4000) };
+    const versions = await (await fetch("https://ddragon.leagueoflegends.com/api/versions.json", opt)).json();
+    const cj = await (await fetch(`https://ddragon.leagueoflegends.com/cdn/${versions[0]}/data/en_US/champion.json`, opt)).json();
+    for (const k in cj.data) { const c = cj.data[k]; map[Number(c.key)] = c.id; }
+  } catch (_) {}
+  DDRAGON_MAP = map;
+  return map;
+}
+
+// チャンピオンID→名前。Data Dragon + 試合データで解決。
+async function getChampMap(matches) {
+  const map = Object.assign({}, await getDdragonMap());
   for (const m of matches) for (const p of (m.info && m.info.participants) || []) {
     if (p.championId && p.championName) map[p.championId] = p.championName;
   }
-  try {
-    const vRes = await fetch("https://ddragon.leagueoflegends.com/api/versions.json");
-    const versions = await vRes.json();
-    const v = versions[0];
-    const cRes = await fetch(`https://ddragon.leagueoflegends.com/cdn/${v}/data/en_US/champion.json`);
-    const cj = await cRes.json();
-    for (const k in cj.data) { const c = cj.data[k]; map[Number(c.key)] = c.id; }
-  } catch (_) {}
   return map;
 }
 
@@ -127,13 +143,6 @@ function buildResult(puuid, matches, masteryRaw, champMap) {
     const c = me.challenges || {};
     const pos = me.teamPosition || "";
 
-    // 対面（同ポジションの敵）
-    let oppChampion = null;
-    if (pos) {
-      const opp = info.participants.find((p) => p.teamId !== me.teamId && p.teamPosition === pos);
-      if (opp) oppChampion = opp.championName;
-    }
-
     games.push({
       queueId: info.queueId,
       champion: me.championName,
@@ -150,7 +159,6 @@ function buildResult(puuid, matches, masteryRaw, champMap) {
       totalTakedowns: me.kills + me.assists,
       objectiveTakedowns: (c.dragonTakedowns || 0) + (c.baronTakedowns || 0) + (c.riftHeraldTakedowns || 0) + (me.turretTakedowns || 0),
       durationMin: mins,
-      oppChampion,
     });
   }
 
@@ -162,30 +170,12 @@ function buildResult(puuid, matches, masteryRaw, champMap) {
 
   return {
     mastery,
-    matchups: computeMatchups(games),
     buckets: {
       all: diagnose(games),
       ranked: diagnose(games.filter((g) => RANKED_QUEUES.has(g.queueId))),
       normal: diagnose(games.filter((g) => NORMAL_QUEUES.has(g.queueId))),
     },
   };
-}
-
-// 対面相性：6戦以上に絞って得意/苦手を1体ずつ（全キュー合算でサンプル確保）
-function computeMatchups(games) {
-  const by = {};
-  for (const g of games) {
-    if (!g.oppChampion) continue;
-    by[g.oppChampion] = by[g.oppChampion] || { champion: g.oppChampion, games: 0, wins: 0 };
-    by[g.oppChampion].games++;
-    if (g.win) by[g.oppChampion].wins++;
-  }
-  const arr = Object.values(by).map((x) => ({ ...x, winrate: x.wins / x.games }))
-    .filter((x) => x.games >= MATCHUP_MIN);
-  if (arr.length === 0) return { threshold: MATCHUP_MIN, best: null, worst: null };
-  const best = arr.slice().sort((a, b) => b.winrate - a.winrate || b.games - a.games)[0];
-  const worst = arr.slice().sort((a, b) => a.winrate - b.winrate || b.games - a.games)[0];
-  return { threshold: MATCHUP_MIN, best, worst: (worst.champion === best.champion ? null : worst) };
 }
 
 // 1バケット分の診断
