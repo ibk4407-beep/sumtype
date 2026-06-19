@@ -1,18 +1,20 @@
 // netlify/functions/analyze.js
 // LoL プレイヤー特性診断 — Riot 公式 API プロキシ + 集計 + 診断エンジン
-// 日本サーバー(JP1)運用。account-v1 / match-v5 は asia ルーティング、ランクは jp1。
+// 日本サーバー(JP1)運用。account-v1 / match-v5 は asia ルーティング、ランク/マスタリーは jp1。
 
-const PLATFORM = "jp1";      // summoner / league (ランク)
-const REGION = "asia";       // account-v1 / match-v5 (JPはasiaクラスタ)
+const PLATFORM = "jp1";   // summoner / league / champion-mastery
+const REGION = "asia";    // account-v1 / match-v5 (JPはasiaクラスタ)
 
-// 解析対象にするキュー（サモナーズリフトのみ。ARAM等は性格判定が歪むので除外）
-const SR_QUEUES = new Set([400, 420, 430, 440, 700]); // 通常Draft/ランクSolo/通常Blind/ランクFlex/Clash
-const MATCH_COUNT = 30;      // 直近の取得試合数
-const MIN_DURATION = 300;    // 5分未満はリメイク扱いで除外
+// 解析対象キュー
+const RANKED_QUEUES = new Set([420, 440]);        // ランクSolo / ランクFlex
+const NORMAL_QUEUES = new Set([400, 430]);        // 通常Draft / 通常Blind
+const SR_QUEUES = new Set([400, 420, 430, 440, 700]); // 上記 + Clash（全体に含める）
+const MATCH_COUNT = 50;     // 直近の取得試合数
+const MIN_DURATION = 300;   // 5分未満はリメイク扱いで除外
+const MATCHUP_MIN = 6;      // 対面サンプル：5戦以下は除外（6戦以上を採用）
+const MASTERY_TOP = 8;      // 表示するマスタリー上位数
 
-// ロール別の基準値 [低い, 高い]。JPソロキューのおおよその目安（要キャリブレーション）。
-// dmgShare=チームダメージ占有率, vision=視界/分, deaths=平均デス, obj=オブジェクト関与/試合,
-// kills=平均キル, early=15分前テイクダウン比率, cs=分間CS, kp=キル関与率
+// ロール別の基準値 [低い, 高い]（JPソロキューのおおよその目安・要キャリブレーション）
 const ROLE_BASELINES = {
   TOP:     { dmgShare: [0.18, 0.28], vision: [0.4, 0.9], deaths: [4, 8],   obj: [1, 3.5], kills: [3, 8], early: [0.20, 0.50], cs: [6.0, 8.5], kp: [0.45, 0.62] },
   JUNGLE:  { dmgShare: [0.15, 0.24], vision: [0.7, 1.4], deaths: [4, 8],   obj: [2.5, 6], kills: [3, 8], early: [0.30, 0.60], cs: [4.8, 6.5], kp: [0.55, 0.72] },
@@ -29,24 +31,18 @@ const headers = {
 
 exports.handler = async (event) => {
   const key = process.env.RIOT_API_KEY;
-  if (!key) {
-    return resp(500, { error: "サーバーに RIOT_API_KEY が設定されていません。Netlify の環境変数を確認してください。" });
-  }
+  if (!key) return resp(500, { error: "サーバーに RIOT_API_KEY が設定されていません。Netlify の環境変数を確認してください。" });
 
   const q = event.queryStringParameters || {};
   const gameName = (q.gameName || "").trim();
   const tagLine = (q.tagLine || "").replace(/^#/, "").trim();
-  if (!gameName || !tagLine) {
-    return resp(400, { error: "Riot ID（名前とタグ）を入力してください。例：zaccident / omg" });
-  }
+  if (!gameName || !tagLine) return resp(400, { error: "Riot ID（名前とタグ）を入力してください。例：zaccident / omg" });
 
-  const riot = (host, path) =>
-    fetch(`https://${host}.api.riotgames.com${path}`, { headers: { "X-Riot-Token": key } });
+  const riot = (host, path) => fetch(`https://${host}.api.riotgames.com${path}`, { headers: { "X-Riot-Token": key } });
 
   try {
     // 1. Riot ID → PUUID
-    const accRes = await riot(REGION,
-      `/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`);
+    const accRes = await riot(REGION, `/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`);
     if (accRes.status === 404) return resp(404, { error: `「${gameName}#${tagLine}」が見つかりませんでした。Riot ID とタグを確認してください。` });
     if (accRes.status === 401 || accRes.status === 403) return resp(502, { error: "APIキーが無効か期限切れです。Riot の開発者ポータルでキーを更新してください。" });
     if (accRes.status === 429) return resp(429, { error: "Riot API のレート制限に達しました。少し待って再試行してください。" });
@@ -55,19 +51,16 @@ exports.handler = async (event) => {
     const puuid = account.puuid;
 
     // 2. 試合IDリスト
-    const idsRes = await riot(REGION,
-      `/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=${MATCH_COUNT}`);
+    const idsRes = await riot(REGION, `/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=${MATCH_COUNT}`);
     if (!idsRes.ok) return resp(502, { error: `試合リスト取得に失敗しました (HTTP ${idsRes.status})` });
     const matchIds = await idsRes.json();
-    if (!Array.isArray(matchIds) || matchIds.length === 0) {
-      return resp(404, { error: "直近の試合データが見つかりませんでした。" });
-    }
+    if (!Array.isArray(matchIds) || matchIds.length === 0) return resp(404, { error: "直近の試合データが見つかりませんでした。" });
 
-    // 3. 各試合の詳細（順次取得：dev keyのレート制限内に収める）
+    // 3. 各試合の詳細（順次取得）
     const matches = [];
     for (const id of matchIds) {
       const mRes = await riot(REGION, `/lol/match/v5/matches/${id}`);
-      if (mRes.status === 429) break; // 制限に当たったらそこまでで集計
+      if (mRes.status === 429) break;
       if (mRes.ok) matches.push(await mRes.json());
     }
 
@@ -78,27 +71,46 @@ exports.handler = async (event) => {
       if (lRes.ok) {
         const entries = await lRes.json();
         const solo = entries.find((e) => e.queueType === "RANKED_SOLO_5x5") || entries[0];
-        if (solo) rank = { tier: solo.tier, division: solo.rank, lp: solo.leaguePoints,
-          wins: solo.wins, losses: solo.losses, queue: solo.queueType };
+        if (solo) rank = { tier: solo.tier, division: solo.rank, lp: solo.leaguePoints, wins: solo.wins, losses: solo.losses };
       }
-    } catch (_) { /* ランクは取れなくても続行 */ }
+    } catch (_) {}
 
-    // 5. 集計 + 診断
-    const result = analyze(puuid, matches);
-    return resp(200, {
-      riotId: `${account.gameName}#${account.tagLine}`,
-      rank,
-      ...result,
-    });
+    // 5. マスタリー（任意）
+    let masteryRaw = [];
+    try {
+      const mRes = await riot(PLATFORM, `/lol/champion-mastery/v4/champion-masteries/by-puuid/${puuid}/top?count=${MASTERY_TOP}`);
+      if (mRes.ok) masteryRaw = await mRes.json();
+    } catch (_) {}
+
+    // 6. チャンピオンID→名前マップ（試合データ + Data Dragon）
+    const champMap = await getChampMap(matches);
+
+    const result = buildResult(puuid, matches, masteryRaw, champMap);
+    return resp(200, { riotId: `${account.gameName}#${account.tagLine}`, rank, ...result });
   } catch (err) {
     return resp(500, { error: "サーバー内部エラー: " + (err && err.message ? err.message : String(err)) });
   }
 };
 
+// チャンピオンID→名前。まず試合データ、足りない分を Data Dragon で補完。
+async function getChampMap(matches) {
+  const map = {};
+  for (const m of matches) for (const p of (m.info && m.info.participants) || []) {
+    if (p.championId && p.championName) map[p.championId] = p.championName;
+  }
+  try {
+    const vRes = await fetch("https://ddragon.leagueoflegends.com/api/versions.json");
+    const versions = await vRes.json();
+    const v = versions[0];
+    const cRes = await fetch(`https://ddragon.leagueoflegends.com/cdn/${v}/data/en_US/champion.json`);
+    const cj = await cRes.json();
+    for (const k in cj.data) { const c = cj.data[k]; map[Number(c.key)] = c.id; }
+  } catch (_) {}
+  return map;
+}
+
 // ---------------------------------------------------------------------------
-// 集計 + 診断ロジック
-// ---------------------------------------------------------------------------
-function analyze(puuid, matches) {
+function buildResult(puuid, matches, masteryRaw, champMap) {
   const games = [];
   for (const m of matches) {
     const info = m.info;
@@ -113,10 +125,20 @@ function analyze(puuid, matches) {
     const teamDmg = sum(myTeam, "totalDamageDealtToChampions") || 1;
     const mins = info.gameDuration / 60;
     const c = me.challenges || {};
+    const pos = me.teamPosition || "";
+
+    // 対面（同ポジションの敵）
+    let oppChampion = null;
+    if (pos) {
+      const opp = info.participants.find((p) => p.teamId !== me.teamId && p.teamPosition === pos);
+      if (opp) oppChampion = opp.championName;
+    }
 
     games.push({
+      queueId: info.queueId,
       champion: me.championName,
-      role: me.teamPosition || me.individualPosition || "",
+      championId: me.championId,
+      role: pos,
       win: !!me.win,
       kills: me.kills, deaths: me.deaths, assists: me.assists,
       kp: c.killParticipation != null ? c.killParticipation : (me.kills + me.assists) / teamKills,
@@ -126,20 +148,52 @@ function analyze(puuid, matches) {
       soloKills: c.soloKills || 0,
       earlyTakedowns: c.takedownsBefore15Minutes != null ? c.takedownsBefore15Minutes : null,
       totalTakedowns: me.kills + me.assists,
-      objectiveTakedowns:
-        (c.dragonTakedowns || 0) + (c.baronTakedowns || 0) +
-        (c.riftHeraldTakedowns || 0) + (me.turretTakedowns || 0),
+      objectiveTakedowns: (c.dragonTakedowns || 0) + (c.baronTakedowns || 0) + (c.riftHeraldTakedowns || 0) + (me.turretTakedowns || 0),
       durationMin: mins,
+      oppChampion,
     });
   }
 
-  if (games.length === 0) {
-    return { sampleSize: 0, error: "解析可能なサモナーズリフトの試合がありませんでした。" };
+  const mastery = (masteryRaw || []).map((m) => ({
+    name: champMap[m.championId] || ("Champion#" + m.championId),
+    points: m.championPoints,
+    level: m.championLevel,
+  }));
+
+  return {
+    mastery,
+    matchups: computeMatchups(games),
+    buckets: {
+      all: diagnose(games),
+      ranked: diagnose(games.filter((g) => RANKED_QUEUES.has(g.queueId))),
+      normal: diagnose(games.filter((g) => NORMAL_QUEUES.has(g.queueId))),
+    },
+  };
+}
+
+// 対面相性：6戦以上に絞って得意/苦手を1体ずつ（全キュー合算でサンプル確保）
+function computeMatchups(games) {
+  const by = {};
+  for (const g of games) {
+    if (!g.oppChampion) continue;
+    by[g.oppChampion] = by[g.oppChampion] || { champion: g.oppChampion, games: 0, wins: 0 };
+    by[g.oppChampion].games++;
+    if (g.win) by[g.oppChampion].wins++;
   }
+  const arr = Object.values(by).map((x) => ({ ...x, winrate: x.wins / x.games }))
+    .filter((x) => x.games >= MATCHUP_MIN);
+  if (arr.length === 0) return { threshold: MATCHUP_MIN, best: null, worst: null };
+  const best = arr.slice().sort((a, b) => b.winrate - a.winrate || b.games - a.games)[0];
+  const worst = arr.slice().sort((a, b) => a.winrate - b.winrate || b.games - a.games)[0];
+  return { threshold: MATCHUP_MIN, best, worst: (worst.champion === best.champion ? null : worst) };
+}
 
+// 1バケット分の診断
+function diagnose(games) {
   const n = games.length;
-  const avg = (f) => games.reduce((s, g) => s + f(g), 0) / n;
+  if (n === 0) return { sampleSize: 0 };
 
+  const avg = (f) => games.reduce((s, g) => s + f(g), 0) / n;
   const avgKills = avg((g) => g.kills);
   const avgDeaths = avg((g) => g.deaths);
   const avgAssists = avg((g) => g.assists);
@@ -152,20 +206,17 @@ function analyze(puuid, matches) {
   const deathSd = stddev(games.map((g) => g.deaths));
   const winrate = games.filter((g) => g.win).length / n;
 
-  // 序盤型度合い（15分前のテイクダウン比率 + 平均試合時間の短さ）
   const earlyRatio = (() => {
-    const withEarly = games.filter((g) => g.earlyTakedowns != null && g.totalTakedowns > 0);
-    if (withEarly.length === 0) return 0.5;
-    return withEarly.reduce((s, g) => s + g.earlyTakedowns / g.totalTakedowns, 0) / withEarly.length;
+    const w = games.filter((g) => g.earlyTakedowns != null && g.totalTakedowns > 0);
+    if (w.length === 0) return 0.5;
+    return w.reduce((s, g) => s + g.earlyTakedowns / g.totalTakedowns, 0) / w.length;
   })();
 
-  // チャンピオン別集計
   const byChamp = {};
   for (const g of games) {
-    const k = g.champion;
-    byChamp[k] = byChamp[k] || { champion: k, games: 0, wins: 0 };
-    byChamp[k].games++;
-    if (g.win) byChamp[k].wins++;
+    byChamp[g.champion] = byChamp[g.champion] || { champion: g.champion, games: 0, wins: 0 };
+    byChamp[g.champion].games++;
+    if (g.win) byChamp[g.champion].wins++;
   }
   const champArr = Object.values(byChamp).map((c) => ({ ...c, winrate: c.wins / c.games }));
   champArr.sort((a, b) => b.games - a.games);
@@ -176,26 +227,22 @@ function analyze(puuid, matches) {
   const uniqueChamps = champArr.length;
   const topShare = mostPlayed.length ? mostPlayed[0].games / n : 0;
 
-  // ロール分布
   const roleCount = {};
   for (const g of games) if (g.role) roleCount[g.role] = (roleCount[g.role] || 0) + 1;
   const mainRole = Object.entries(roleCount).sort((a, b) => b[1] - a[1])[0]?.[0] || "";
   const base = ROLE_BASELINES[mainRole] || ROLE_BASELINES.DEFAULT;
 
-  // --- 5軸スコア（0-100）。基準値はロール別（ROLE_BASELINES）で正規化 ---
   const axes = {
-    tempo: scoreBetween(earlyRatio, base.early[0], base.early[1]) * 0.6 + scoreBetween(35 - avgDur, 35 - 32, 35 - 26) * 0.4, // 高い=序盤型
-    role: scoreBetween(avgDmgShare, base.dmgShare[0], base.dmgShare[1]) * 0.6 + (100 - scoreBetween(avgVision, base.vision[0], base.vision[1])) * 0.4, // 高い=キャリー型
-    risk: scoreBetween(avgDeaths, base.deaths[0], base.deaths[1]) * 0.6 + scoreBetween(deathSd, 1.5, 4) * 0.4, // 高い=ハイリスク
-    pool: scoreBetween(topShare, 0.2, 0.6) * 0.5 + scoreBetween(8 - uniqueChamps, 8 - 12, 8 - 3) * 0.5, // 高い=スペシャリスト（ロール非依存）
-    macro: scoreBetween(avgObj, base.obj[0], base.obj[1]) * 0.6 + (100 - scoreBetween(avgKills, base.kills[0], base.kills[1])) * 0.4, // 高い=マクロ型
+    tempo: scoreBetween(earlyRatio, base.early[0], base.early[1]) * 0.6 + scoreBetween(35 - avgDur, 35 - 32, 35 - 26) * 0.4,
+    role: scoreBetween(avgDmgShare, base.dmgShare[0], base.dmgShare[1]) * 0.6 + (100 - scoreBetween(avgVision, base.vision[0], base.vision[1])) * 0.4,
+    risk: scoreBetween(avgDeaths, base.deaths[0], base.deaths[1]) * 0.6 + scoreBetween(deathSd, 1.5, 4) * 0.4,
+    pool: scoreBetween(topShare, 0.2, 0.6) * 0.5 + scoreBetween(8 - uniqueChamps, 8 - 12, 8 - 3) * 0.5,
+    macro: scoreBetween(avgObj, base.obj[0], base.obj[1]) * 0.6 + (100 - scoreBetween(avgKills, base.kills[0], base.kills[1])) * 0.4,
   };
   for (const k in axes) axes[k] = clamp(Math.round(axes[k]), 0, 100);
 
-  // --- 暫定タイプ判定（※summonertypeの20タイプは次ステップで差し込み） ---
   const type = decideType(axes);
 
-  // --- 課題（弱点）テキスト：ロール別基準で判定 ---
   const weaknesses = [];
   if (avgVision < base.vision[0]) weaknesses.push("視界スコアがロール基準より低め。コントロールワードと敵ジャングルの視界管理を増やすとマップ判断が安定します。");
   if (avgDeaths > base.deaths[1]) weaknesses.push("平均デスがロール基準より多め。優位でない場面でのオーバーステイを減らすと安定します。");
@@ -224,9 +271,8 @@ function analyze(puuid, matches) {
   };
 }
 
-// 暫定タイプ：5軸の最も尖った傾向からラベル付け（2〜3文字、世界観寄せ）
 function decideType(a) {
-  const lean = (v) => v - 50; // -50..+50
+  const lean = (v) => v - 50;
   const traits = [
     { name: "tempo", abs: Math.abs(lean(a.tempo)), hi: "強襲", lo: "大器" },
     { name: "role", abs: Math.abs(lean(a.role)), hi: "首魁", lo: "采配" },
@@ -252,7 +298,6 @@ function decideType(a) {
   return { label, blurb, primaryAxis: primary.name };
 }
 
-// ---- helpers ----
 function scoreBetween(v, lo, hi) { return clamp(((v - lo) / (hi - lo)) * 100, 0, 100); }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function sum(arr, key) { return arr.reduce((s, x) => s + (x[key] || 0), 0); }
