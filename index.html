@@ -281,9 +281,10 @@ function renderResult(d, isDemo) {
   // 伸びしろ
   document.getElementById("r-weak").innerHTML = (d.weaknesses||[]).map(w => `<li>${w}</li>`).join("");
 
+  const roleJP = { TOP:"トップ", JUNGLE:"ジャングル", MIDDLE:"ミッド", BOTTOM:"ボット", UTILITY:"サポート" }[d.mainRole] || "全ロール";
   document.getElementById("r-note").textContent = isDemo
     ? "※ これはサンプルデータによるデモ表示です。実データには Riot APIキーの設定とデプロイが必要です。"
-    : "※ 直近のサモナーズリフトの試合をもとに算出。各軸のしきい値は今後の調整で精度が上がります。";
+    : `※ 直近のサモナーズリフトの試合をもとに、${roleJP}の基準値で正規化して算出しています。`;
 
   document.getElementById("result").classList.add("show");
   document.getElementById("result").scrollIntoView({ behavior: "smooth", block: "start" });
